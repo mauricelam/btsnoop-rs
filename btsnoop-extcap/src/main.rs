@@ -150,7 +150,9 @@ async fn print_packets(
     } else {
         let root_shell = match adb::root(adb_path, serial).await {
             Err(e @ AdbRootError::RootDeclined) => {
-                extcap_control.info_message("Unable to run `adb root`. Make sure your device is on a userdebug or eng build").await?;
+                extcap_control.info_message(
+                    "Unable to get root access. Make sure your device is rooted or on a userdebug/eng build"
+                ).await?;
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Err(e)?
             }
@@ -255,8 +257,13 @@ async fn main() -> anyhow::Result<()> {
                 async {
                     if let Some(mut reader) = extcap_reader {
                         while let Ok(packet) = reader.read_control_packet().await {
-                            handle_control_packet(adb_path, serial, packet, &mut *extcap_sender.lock().await)
-                                .await?;
+                            handle_control_packet(
+                                adb_path,
+                                serial,
+                                packet,
+                                &mut *extcap_sender.lock().await,
+                            )
+                            .await?;
                         }
                     }
                     debug!("Control packet handling ending");

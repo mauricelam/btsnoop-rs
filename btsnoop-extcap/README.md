@@ -33,10 +33,17 @@ Detected devices are shown in Wireshark's __Capture__ interface list.
 
 ## Instructions to turn on btsnoop log capturing
 
+#### Option 1
+
+1. In Wireshark, open the toolbar View > Interface Toolbars > Android btsnoop
+2. Select the btsnoop interface in the main Wireshark window
+3. Click "Turn on BT logging" in the toolbar
+
+#### Option 2
+
 1. Enable __Developer options__ on the device.
 2. In the __Developer options__ menu, activate the __Enable Bluetooth HCI snoop log__ toggle.
 3. Restart Bluetooth for logging to take effect.
-4. Run `adb root`
 
 ## Relationship with `androiddump`
 

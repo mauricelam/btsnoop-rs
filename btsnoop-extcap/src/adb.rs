@@ -8,7 +8,7 @@ use tokio::process::Command;
 
 #[derive(Error, Debug)]
 pub enum AdbRootError {
-    #[error("Root was declined. Check that you are on a userdebug or eng build.")]
+    #[error("Unable to get root access. Make sure your device is rooted or on a userdebug/eng build.")]
     RootDeclined,
 
     #[error(transparent)]
@@ -81,6 +81,7 @@ pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootErro
         .await?
         .stdout;
     debug!("Shell UID={shell_uid:?}");
+    // If only `adb root` will return a different exit code...
     if trim_end(&shell_uid) != b"0" {
         let shell_uid = shell(serial, "su -c id -u")
             .stdout(Stdio::piped())
@@ -89,7 +90,6 @@ pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootErro
             .await?
             .stdout;
         if trim_end(&shell_uid) != b"0" {
-            // If only `adb root` will return a different exit code...
             Err(AdbRootError::RootDeclined)?;
         } else {
             return Ok(RootShell {
