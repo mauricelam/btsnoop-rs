@@ -25,6 +25,7 @@ use std::{
     io::{stdout, Write},
     process::Stdio,
     time::{Duration, Instant},
+    path::{Path, PathBuf},
 };
 use tokio::{
     fs::File,
@@ -102,7 +103,7 @@ async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
 }
 
 async fn handle_control_packet(
-    adb_path: &str,
+    adb_path: &Path,
     serial: &str,
     control_packet: ControlPacket<'_>,
     extcap_control: &mut Option<ExtcapControlSender>,
@@ -135,7 +136,7 @@ async fn handle_control_packet(
 }
 
 async fn print_packets(
-    adb_path: &str,
+    adb_path: &Path,
     serial: &str,
     extcap_control: &Mutex<Option<ExtcapControlSender>>,
     output_fifo: &mut std::fs::File,
@@ -217,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
         .build();
     match args.extcap.run()? {
         ExtcapStep::Interfaces(interfaces_step) => {
-            let interfaces: Vec<Interface> = adb::adb_devices(args.adb_path)
+            let interfaces: Vec<Interface> = adb::adb_devices(&adb_path(args.adb_path)?)
                 .await?
                 .iter()
                 .map(|d| {
@@ -252,13 +253,13 @@ async fn main() -> anyhow::Result<()> {
             let extcap_reader = capture_step.new_control_reader_async().await;
             let extcap_sender: Mutex<Option<ExtcapControlSender>> =
                 Mutex::new(capture_step.new_control_sender_async().await);
-            let adb_path = args.adb_path.as_deref().unwrap_or("adb");
+            let adb_path = adb_path(args.adb_path)?;
             let result = tokio::try_join!(
                 async {
                     if let Some(mut reader) = extcap_reader {
                         while let Ok(packet) = reader.read_control_packet().await {
                             handle_control_packet(
-                                adb_path,
+                                &adb_path,
                                 serial,
                                 packet,
                                 &mut *extcap_sender.lock().await,
@@ -270,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok::<(), anyhow::Error>(())
                 },
                 print_packets(
-                    adb_path,
+                    &adb_path,
                     serial,
                     &extcap_sender,
                     &mut capture_step.fifo,
@@ -285,4 +286,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn adb_path(adb_path: Option<String>) -> anyhow::Result<PathBuf> {
+    match adb_path {
+        Some(path) => Ok(path.into()),
+        None => Ok(which::which("adb")
+        .unwrap_or_else(|_| [dirs_next::data_local_dir().unwrap(), PathBuf::from(r"Android\sdk\platform-tools\adb")].iter().collect())),
+    }
 }

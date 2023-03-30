@@ -1,6 +1,6 @@
 //! Utilities for functionalities related to Android Debug Bridge.
 
-use std::{io::BufRead, process::Stdio};
+use std::{io::BufRead, process::Stdio, path::{Path, PathBuf}};
 
 use log::debug;
 use thiserror::Error;
@@ -33,7 +33,7 @@ fn trim_end_test() {
 /// An ADB shell that can be rooted.
 pub struct RootShell {
     /// Path to the adb executable
-    adb_path: String,
+    adb_path: PathBuf,
     /// The serial number of the Android device
     serial: String,
     /// Whether `su` is needed on subsequent shell invocations. This is true
@@ -67,14 +67,14 @@ impl RootShell {
 }
 
 /// Run adb root on the given device.
-pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootError> {
-    Command::new("adb")
+pub async fn root(adb_path: &Path, serial: &str) -> Result<RootShell, AdbRootError> {
+    Command::new(adb_path)
         .args(["-s", serial, "root"])
         .stdout(Stdio::null())
         .spawn()?
         .wait()
         .await?;
-    let shell_uid = shell(serial, "id -u")
+    let shell_uid = shell(adb_path, serial, "id -u")
         .stdout(Stdio::piped())
         .spawn()?
         .wait_with_output()
@@ -83,7 +83,7 @@ pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootErro
     debug!("Shell UID={shell_uid:?}");
     // If only `adb root` will return a different exit code...
     if trim_end(&shell_uid) != b"0" {
-        let shell_uid = shell(serial, "su -c id -u")
+        let shell_uid = shell(adb_path, serial, "su -c id -u")
             .stdout(Stdio::piped())
             .spawn()?
             .wait_with_output()
@@ -93,14 +93,14 @@ pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootErro
             Err(AdbRootError::RootDeclined)?;
         } else {
             return Ok(RootShell {
-                adb_path: adb_path.to_string(),
+                adb_path: adb_path.to_owned(),
                 serial: serial.to_string(),
                 needs_su: true,
             });
         }
     }
     Ok(RootShell {
-        adb_path: adb_path.to_string(),
+        adb_path: adb_path.to_owned(),
         serial: serial.to_string(),
         needs_su: false,
     })
@@ -113,8 +113,8 @@ pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootErro
 /// let cmd = adb::shell(serial, format!("echo {}", serial)).spawn()?;
 /// assert_eq!(cmd.wait_with_output().await?.stdout, serial);
 /// ```
-pub fn shell(serial: &str, command: &str) -> Command {
-    let mut cmd = Command::new("adb");
+pub fn shell(adb_path: &Path, serial: &str, command: &str) -> Command {
+    let mut cmd = Command::new(adb_path);
     cmd.args(["-s", serial, "shell", command]);
     cmd
 }
@@ -129,13 +129,12 @@ pub struct AdbDevice {
 }
 
 /// Query `adb devices` for the list of devices, and return a vec of [`AdbDevice`] structs.
-pub async fn adb_devices(adb_path: Option<String>) -> anyhow::Result<Vec<AdbDevice>> {
+pub async fn adb_devices(adb_path: &Path) -> anyhow::Result<Vec<AdbDevice>> {
     debug!("Getting adb devices from {adb_path:?}");
-    let adb_path = adb_path.as_deref().unwrap_or("adb");
-    if adb_path == "mock" {
+    if adb_path == Path::new("mock") {
         return Ok(mock_adb_devices());
     }
-    let cmd = Command::new("adb")
+    let cmd = Command::new(adb_path)
         .arg("devices")
         .arg("-l")
         .stdout(Stdio::piped())
