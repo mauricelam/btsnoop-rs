@@ -1,8 +1,7 @@
 //! Utilities for functionalities related to Android Debug Bridge.
 
-use std::{io::BufRead, process::Stdio, time::Duration};
+use std::{io::BufRead, process::Stdio};
 
-use anyhow::anyhow;
 use log::debug;
 use thiserror::Error;
 use tokio::process::Command;
@@ -16,8 +15,59 @@ pub enum AdbRootError {
     IoError(#[from] std::io::Error),
 }
 
+fn trim_end(input: &[u8]) -> &[u8] {
+    match input.iter().rposition(|c| !u8::is_ascii_whitespace(c)) {
+        Some(pos) => &input[..=pos],
+        None => b"",
+    }
+}
+
+#[test]
+fn trim_end_test() {
+    assert_eq!(trim_end(b"hi"), b"hi");
+    assert_eq!(trim_end(b"hi\n"), b"hi");
+    assert_eq!(trim_end(b"hi\r\n"), b"hi");
+    assert_eq!(trim_end(b"\r\n"), b"");
+}
+
+/// An ADB shell that can be rooted.
+pub struct RootShell {
+    /// Path to the adb executable
+    adb_path: String,
+    /// The serial number of the Android device
+    serial: String,
+    /// Whether `su` is needed on subsequent shell invocations. This is true
+    /// typically on a rooted production build. If false, we can run `adb root`
+    /// to gain root access, so subsequent shell invocations don't need `su`.
+    needs_su: bool,
+}
+
+impl RootShell {
+    /// Run adb shell on the given device.
+    ///
+    /// Example:
+    /// ```
+    /// let cmd = adb::shell(serial, format!("echo {}", serial)).spawn()?;
+    /// assert_eq!(cmd.wait_with_output().await?.stdout, serial);
+    /// ```
+    pub fn shell(&self, command: &str) -> Command {
+        let mut cmd = Command::new(&self.adb_path);
+        if !self.needs_su {
+            cmd.args(["-s", &self.serial, "shell", command]);
+        } else {
+            cmd.args([
+                "-s",
+                &self.serial,
+                "shell",
+                &format!("su -c {}", shlex::quote(command)),
+            ]);
+        }
+        cmd
+    }
+}
+
 /// Run adb root on the given device.
-pub async fn root(serial: &str) -> Result<(), AdbRootError> {
+pub async fn root(adb_path: &str, serial: &str) -> Result<RootShell, AdbRootError> {
     Command::new("adb")
         .args(["-s", serial, "root"])
         .stdout(Stdio::null())
@@ -31,11 +81,29 @@ pub async fn root(serial: &str) -> Result<(), AdbRootError> {
         .await?
         .stdout;
     debug!("Shell UID={shell_uid:?}");
-    if shell_uid != b"0\n" {
-        // If only `adb root` will return a different exit code...
-        Err(AdbRootError::RootDeclined)?;
+    if trim_end(&shell_uid) != b"0" {
+        let shell_uid = shell(serial, "su -c id -u")
+            .stdout(Stdio::piped())
+            .spawn()?
+            .wait_with_output()
+            .await?
+            .stdout;
+        if trim_end(&shell_uid) != b"0" {
+            // If only `adb root` will return a different exit code...
+            Err(AdbRootError::RootDeclined)?;
+        } else {
+            return Ok(RootShell {
+                adb_path: adb_path.to_string(),
+                serial: serial.to_string(),
+                needs_su: true,
+            });
+        }
     }
-    Ok(())
+    Ok(RootShell {
+        adb_path: adb_path.to_string(),
+        serial: serial.to_string(),
+        needs_su: false,
+    })
 }
 
 /// Run adb shell on the given device.
@@ -119,25 +187,22 @@ pub enum BtsnoopLogMode {
 pub enum BtsnoopLogSettings {}
 
 impl BtsnoopLogSettings {
-    pub async fn set_mode(serial: &str, mode: BtsnoopLogMode) -> std::io::Result<()> {
+    pub async fn set_mode(shell: &RootShell, mode: BtsnoopLogMode) -> std::io::Result<()> {
         let mode_str = match mode {
             BtsnoopLogMode::Disabled => "disabled",
             BtsnoopLogMode::Filtered => "filtered",
             BtsnoopLogMode::Full => "full",
         };
-        shell(
-            serial,
-            &format!("setprop persist.bluetooth.btsnooplogmode {mode_str}"),
-        )
-        .spawn()?
-        .wait()
-        .await?;
-        shell(serial, "svc bluetooth disable")
-            .spawn()?
-            .wait()
-            .await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        shell(serial, "svc bluetooth enable")
+        shell
+            .shell(&format!(
+                concat!(
+                    "setprop persist.bluetooth.btsnooplogmode {mode}",
+                    " && svc bluetooth disable",
+                    " && sleep 2",
+                    " && svc bluetooth enable"
+                ),
+                mode = mode_str
+            ))
             .spawn()?
             .wait()
             .await?;
@@ -145,16 +210,17 @@ impl BtsnoopLogSettings {
     }
 
     /// Gets the value of btsnoop log mode setting.
-    pub async fn mode(serial: &str) -> anyhow::Result<BtsnoopLogMode> {
-        let btsnooplogmode_proc = shell(serial, "getprop persist.bluetooth.btsnooplogmode")
+    pub async fn mode(root_shell: &RootShell) -> anyhow::Result<BtsnoopLogMode> {
+        let btsnooplogmode_proc = root_shell
+            .shell("getprop persist.bluetooth.btsnooplogmode")
             .stdout(Stdio::piped())
             .spawn()?;
         let output = btsnooplogmode_proc.wait_with_output().await?;
-        match output.stdout.as_slice() {
-            b"full\n" => Ok(BtsnoopLogMode::Full),
-            b"filtered\n" => Ok(BtsnoopLogMode::Filtered),
-            b"disabled\n" => Ok(BtsnoopLogMode::Disabled),
-            _ => Err(anyhow!("Unknown BTsnoop log mode")),
+        match trim_end(&output.stdout) {
+            b"full" => Ok(BtsnoopLogMode::Full),
+            b"filtered" => Ok(BtsnoopLogMode::Filtered),
+            b"disabled" => Ok(BtsnoopLogMode::Disabled),
+            _ => Ok(BtsnoopLogMode::Disabled),
         }
     }
 }

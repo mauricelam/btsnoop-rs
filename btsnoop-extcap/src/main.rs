@@ -102,14 +102,16 @@ async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
 }
 
 async fn handle_control_packet(
-    serial: String,
+    adb_path: &str,
+    serial: &str,
     control_packet: ControlPacket<'_>,
     extcap_control: &mut Option<ExtcapControlSender>,
 ) -> anyhow::Result<()> {
+    let shell = adb::root(adb_path, serial).await?;
     if control_packet.command == ControlCommand::Set {
         if control_packet.control_number == BT_LOGGING_ON_BUTTON.control_number {
             // Turn on
-            BtsnoopLogSettings::set_mode(&serial, BtsnoopLogMode::Full).await?;
+            BtsnoopLogSettings::set_mode(&shell, BtsnoopLogMode::Full).await?;
             extcap_control
                 .send(BT_LOGGING_ON_BUTTON.set_enabled(false))
                 .await?;
@@ -118,7 +120,7 @@ async fn handle_control_packet(
                 .await?;
         } else if control_packet.control_number == BT_LOGGING_OFF_BUTTON.control_number {
             // Turn off
-            BtsnoopLogSettings::set_mode(&serial, BtsnoopLogMode::Disabled).await?;
+            BtsnoopLogSettings::set_mode(&shell, BtsnoopLogMode::Disabled).await?;
             extcap_control
                 .send(BT_LOGGING_OFF_BUTTON.set_enabled(false))
                 .await?;
@@ -133,6 +135,7 @@ async fn handle_control_packet(
 }
 
 async fn print_packets(
+    adb_path: &str,
     serial: &str,
     extcap_control: &Mutex<Option<ExtcapControlSender>>,
     output_fifo: &mut std::fs::File,
@@ -145,16 +148,16 @@ async fn print_packets(
     let write_result = if let Some(test_file) = btsnoop_log_file_path.strip_prefix("local:") {
         write_pcap_packets(File::open(test_file).await?, output_fifo, display_delay).await
     } else {
-        match adb::root(serial).await {
+        let root_shell = match adb::root(adb_path, serial).await {
             Err(e @ AdbRootError::RootDeclined) => {
                 extcap_control.info_message("Unable to run `adb root`. Make sure your device is on a userdebug or eng build").await?;
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Err(e)?
             }
             Err(e) => Err(e)?,
-            Ok(_) => (),
-        }
-        if BtsnoopLogSettings::mode(serial).await? == BtsnoopLogMode::Full {
+            Ok(shell) => shell,
+        };
+        if BtsnoopLogSettings::mode(&root_shell).await? == BtsnoopLogMode::Full {
             extcap_control
                 .send(BT_LOGGING_ON_BUTTON.set_enabled(false))
                 .await?;
@@ -170,13 +173,12 @@ async fn print_packets(
                 .await?;
             extcap_control.status_message("BTsnoop logging is turned off. Use View > Interface Toolbars to show the buttons to turn it on").await?;
         }
-        let mut cmd = adb::shell(
-            serial,
-            format!("tail -F -c +0 {btsnoop_log_file_path}").as_str(),
-        )
-        .stdout(Stdio::piped())
-        .spawn()?;
-        info!("Running adb tail -F -c +0 {btsnoop_log_file_path}");
+        let cmd_string = format!("until [ -f '{btsnoop_log_file_path}' ]; do sleep 1; done; tail -f -c +0 '{btsnoop_log_file_path}'");
+        let mut cmd = root_shell
+            .shell(cmd_string.as_str())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        info!("Running {cmd_string}");
         let stdout = cmd.stdout.as_mut().unwrap();
         write_pcap_packets(stdout, output_fifo, display_delay).await
     };
@@ -248,22 +250,20 @@ async fn main() -> anyhow::Result<()> {
             let extcap_reader = capture_step.new_control_reader_async().await;
             let extcap_sender: Mutex<Option<ExtcapControlSender>> =
                 Mutex::new(capture_step.new_control_sender_async().await);
+            let adb_path = args.adb_path.as_deref().unwrap_or("adb");
             let result = tokio::try_join!(
                 async {
                     if let Some(mut reader) = extcap_reader {
                         while let Ok(packet) = reader.read_control_packet().await {
-                            handle_control_packet(
-                                serial.to_string(),
-                                packet,
-                                &mut *extcap_sender.lock().await,
-                            )
-                            .await?;
+                            handle_control_packet(adb_path, serial, packet, &mut *extcap_sender.lock().await)
+                                .await?;
                         }
                     }
                     debug!("Control packet handling ending");
                     Ok::<(), anyhow::Error>(())
                 },
                 print_packets(
+                    adb_path,
                     serial,
                     &extcap_sender,
                     &mut capture_step.fifo,
