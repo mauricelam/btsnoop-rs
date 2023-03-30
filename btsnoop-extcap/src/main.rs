@@ -25,7 +25,7 @@ use std::{
     io::{stdout, Write},
     process::Stdio,
     time::{Duration, Instant},
-    path::{Path, PathBuf},
+    path::Path,
 };
 use tokio::{
     fs::File,
@@ -218,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
         .build();
     match args.extcap.run()? {
         ExtcapStep::Interfaces(interfaces_step) => {
-            let interfaces: Vec<Interface> = adb::adb_devices(&adb_path(args.adb_path)?)
+            let interfaces: Vec<Interface> = adb::adb_devices(&adb::find_adb(args.adb_path)?)
                 .await?
                 .iter()
                 .map(|d| {
@@ -253,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
             let extcap_reader = capture_step.new_control_reader_async().await;
             let extcap_sender: Mutex<Option<ExtcapControlSender>> =
                 Mutex::new(capture_step.new_control_sender_async().await);
-            let adb_path = adb_path(args.adb_path)?;
+            let adb_path = adb::find_adb(args.adb_path)?;
             let result = tokio::try_join!(
                 async {
                     if let Some(mut reader) = extcap_reader {
@@ -286,12 +286,4 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-fn adb_path(adb_path: Option<String>) -> anyhow::Result<PathBuf> {
-    match adb_path {
-        Some(path) => Ok(path.into()),
-        None => Ok(which::which("adb")
-        .unwrap_or_else(|_| [dirs_next::data_local_dir().unwrap(), PathBuf::from(r"Android\sdk\platform-tools\adb")].iter().collect())),
-    }
 }

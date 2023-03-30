@@ -1,6 +1,10 @@
 //! Utilities for functionalities related to Android Debug Bridge.
 
-use std::{io::BufRead, process::Stdio, path::{Path, PathBuf}};
+use std::{
+    io::BufRead,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use log::debug;
 use thiserror::Error;
@@ -8,7 +12,9 @@ use tokio::process::Command;
 
 #[derive(Error, Debug)]
 pub enum AdbRootError {
-    #[error("Unable to get root access. Make sure your device is rooted or on a userdebug/eng build.")]
+    #[error(
+        "Unable to get root access. Make sure your device is rooted or on a userdebug/eng build."
+    )]
     RootDeclined,
 
     #[error(transparent)]
@@ -221,5 +227,25 @@ impl BtsnoopLogSettings {
             b"disabled" => Ok(BtsnoopLogMode::Disabled),
             _ => Ok(BtsnoopLogMode::Disabled),
         }
+    }
+}
+
+pub fn find_adb(adb_path: Option<String>) -> anyhow::Result<PathBuf> {
+    match adb_path {
+        Some(path) => Ok(path.into()),
+        None => match which::which("adb") {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(if cfg!(target_os = "windows") {
+                let mut adb_default_path = dirs_next::data_local_dir()
+                    .ok_or_else(|| anyhow::format_err!("Cannot find data local directory"))?;
+                adb_default_path.push(r"Android\sdk\platform-tools\adb");
+                adb_default_path
+            } else {
+                let mut adb_default_path = dirs_next::home_dir()
+                    .ok_or_else(|| anyhow::format_err!("Cannot find home directory"))?;
+                adb_default_path.push("Library/Android/Sdk/platform-tools/adb");
+                adb_default_path
+            }),
+        },
     }
 }
