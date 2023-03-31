@@ -5,7 +5,8 @@ use btsnoop::{FileHeader, PacketHeader};
 use btsnoop_ext::Direction;
 use clap::Parser;
 use lazy_static::lazy_static;
-use log::{debug, info, warn};
+use log::{debug, info, warn, LevelFilter};
+use log4rs::{append::file::FileAppender, encode::pattern::PatternEncoder, Config, config::{Appender, Root}};
 use nom_derive::Parse as _;
 use pcap_file::{
     pcap::{PcapHeader, PcapPacket, PcapWriter},
@@ -208,7 +209,16 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    let mut log_path = std::env::temp_dir();
+    log_path.push("btsnoop.log");
+    let logs = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new("{d} {l} - {m}{n}")))
+        .build(log_path)?;
+
+    let config = Config::builder()
+        .appender(Appender::builder().build("btsnoop", Box::new(logs)))
+        .build(Root::builder().appender("btsnoop").build(LevelFilter::Trace))?;
+    log4rs::init_config(config)?;
     let args = BtsnoopArgs::parse();
     debug!("Running with args: {args:#?}");
     let dlt = Dlt::builder()
