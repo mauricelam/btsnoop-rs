@@ -266,9 +266,9 @@ mod adb_assumption_tests {
     use predicates::prelude::predicate;
 
     #[cfg(windows)]
-    const LINE_ENDING: &'static str = "\r\n";
+    const LINE_ENDING: &str = "\r\n";
     #[cfg(not(windows))]
-    const LINE_ENDING: &'static str = "\n";
+    const LINE_ENDING: &str = "\n";
 
     #[test]
     fn adb_exec_out_with_su() {
@@ -279,7 +279,7 @@ mod adb_assumption_tests {
             .arg(r#"su -c "echo -n 'hello\nworld'""#);
         cmd.assert()
             .success()
-            .stdout(predicate::str::diff(format!("hello{LINE_ENDING}world"))
+            .stdout(predicate::str::diff("hello\r\nworld")
         );
     }
 
