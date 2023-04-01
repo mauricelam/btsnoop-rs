@@ -56,18 +56,22 @@ impl RootShell {
     /// let cmd = adb::shell(serial, format!("echo {}", serial)).spawn()?;
     /// assert_eq!(cmd.wait_with_output().await?.stdout, serial);
     /// ```
-    pub fn shell(&self, command: &str) -> Command {
+    pub fn exec_out(&self, command: &str) -> Command {
         let mut cmd = Command::new(&self.adb_path);
         if !self.needs_su {
-            cmd.args(["-s", &self.serial, "shell", command]);
+            cmd.args(["-s", &self.serial, "exec-out", command]);
         } else {
             cmd.args([
                 "-s",
                 &self.serial,
-                "shell",
-                &format!("su -c {}", shlex::quote(command)),
+                "exec-out",
+                // For some reason, `adb exec-out su -c <cmd>` still adds
+                // newlines as if `adb shell` is being used, but that behavior
+                // is suppressed when the output is piped to `cat`.
+                &format!("su -c {} | cat", shlex::quote(command)),
             ]);
         }
+        debug!("ADB shell [{cmd:?}]");
         cmd
     }
 }
@@ -77,11 +81,13 @@ pub async fn root(adb_path: &Path, serial: &str) -> Result<RootShell, AdbRootErr
     Command::new(adb_path)
         .args(["-s", serial, "root"])
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?
-        .wait()
+        .wait_with_output()
         .await?;
-    let shell_uid = shell(adb_path, serial, "id -u")
+    let shell_uid = exec_out(adb_path, serial, "id -u")
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?
         .wait_with_output()
         .await?
@@ -89,8 +95,9 @@ pub async fn root(adb_path: &Path, serial: &str) -> Result<RootShell, AdbRootErr
     debug!("Shell UID={shell_uid:?}");
     // If only `adb root` will return a different exit code...
     if trim_end(&shell_uid) != b"0" {
-        let shell_uid = shell(adb_path, serial, "su -c id -u")
+        let shell_uid = exec_out(adb_path, serial, "su -c id -u")
             .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .spawn()?
             .wait_with_output()
             .await?
@@ -119,9 +126,10 @@ pub async fn root(adb_path: &Path, serial: &str) -> Result<RootShell, AdbRootErr
 /// let cmd = adb::shell(serial, format!("echo {}", serial)).spawn()?;
 /// assert_eq!(cmd.wait_with_output().await?.stdout, serial);
 /// ```
-pub fn shell(adb_path: &Path, serial: &str, command: &str) -> Command {
+pub fn exec_out(adb_path: &Path, serial: &str, command: &str) -> Command {
     let mut cmd = Command::new(adb_path);
-    cmd.args(["-s", serial, "shell", command]);
+    cmd.stderr(Stdio::null());
+    cmd.args(["-s", serial, "exec-out", command]);
     cmd
 }
 
@@ -144,6 +152,7 @@ pub async fn adb_devices(adb_path: &Path) -> anyhow::Result<Vec<AdbDevice>> {
         .arg("devices")
         .arg("-l")
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?;
     let output = cmd.wait_with_output().await?;
     debug!(
@@ -199,7 +208,7 @@ impl BtsnoopLogSettings {
             BtsnoopLogMode::Full => "full",
         };
         shell
-            .shell(&format!(
+            .exec_out(&format!(
                 concat!(
                     "setprop persist.bluetooth.btsnooplogmode {mode}",
                     " && svc bluetooth disable",
@@ -217,7 +226,7 @@ impl BtsnoopLogSettings {
     /// Gets the value of btsnoop log mode setting.
     pub async fn mode(root_shell: &RootShell) -> anyhow::Result<BtsnoopLogMode> {
         let btsnooplogmode_proc = root_shell
-            .shell("getprop persist.bluetooth.btsnooplogmode")
+            .exec_out("getprop persist.bluetooth.btsnooplogmode")
             .stdout(Stdio::piped())
             .spawn()?;
         let output = btsnooplogmode_proc.wait_with_output().await?;
@@ -248,4 +257,63 @@ pub fn find_adb(adb_path: Option<String>) -> anyhow::Result<PathBuf> {
             }),
         },
     }
+}
+
+/// Tests our assumptions about the behavior of adb.
+#[cfg(test)]
+mod adb_assumption_tests {
+    use assert_cmd::Command;
+    use predicates::prelude::predicate;
+
+    #[cfg(windows)]
+    const LINE_ENDING: &'static str = "\r\n";
+    #[cfg(not(windows))]
+    const LINE_ENDING: &'static str = "\n";
+
+    #[test]
+    fn adb_exec_out_with_su() {
+        // We don't really care about the results of this test, but this
+        // illustrates why we needed `| cat` in our implementation.
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("exec-out")
+            .arg(r#"su -c "echo -n 'hello\nworld'""#);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff(format!("hello{LINE_ENDING}world"))
+        );
+    }
+
+    #[test]
+    fn adb_exec_out_with_su_and_cat() {
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("exec-out")
+            .arg(r#"su -c "echo -n 'hello\nworld'" | cat"#);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff("hello\nworld")
+        );
+    }
+
+    #[test]
+    fn adb_exec_out() {
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("exec-out")
+            .arg("echo -n 'hello\nworld'");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff("hello\nworld")
+        );
+    }
+
+    #[test]
+    fn adb_shell() {
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("shell")
+            .arg("echo -n 'hello\nworld'");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff(format!("hello{LINE_ENDING}world"))
+        );
+    }
+
 }

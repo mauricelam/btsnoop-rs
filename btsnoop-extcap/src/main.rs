@@ -5,7 +5,7 @@ use btsnoop::{FileHeader, PacketHeader};
 use btsnoop_ext::Direction;
 use clap::Parser;
 use lazy_static::lazy_static;
-use log::{debug, info, warn, LevelFilter};
+use log::{debug, info, warn, LevelFilter, trace};
 use log4rs::{append::file::FileAppender, encode::pattern::PatternEncoder, Config, config::{Appender, Root}};
 use nom_derive::Parse as _;
 use pcap_file::{
@@ -76,28 +76,37 @@ async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
         endianness: pcap_file::Endianness::Big,
         ..Default::default()
     };
+    trace!("Reading header...");
     let mut header_buf = [0_u8; FileHeader::LENGTH];
     input_reader.read_exact(&mut header_buf[..]).await?;
+    trace!("Parsing header...");
     FileHeader::parse(&header_buf).unwrap();
     let mut pcap_writer = PcapWriter::with_header(output_writer, pcap_header).unwrap();
     let start_time = Instant::now();
+    trace!("Start looping...");
     while let Some(packet_header_buf) = input_reader
         .try_read_exact::<{ PacketHeader::LENGTH }>()
         .await?
     {
+        trace!("read header: {packet_header_buf:?}");
         let (_rem, packet_header) = PacketHeader::parse(&packet_header_buf).unwrap();
+        trace!("Packet length: {packet_header:?}");
         let mut packet_buf: Vec<u8> = vec![0_u8; packet_header.included_length as usize];
         input_reader.read_exact(&mut packet_buf).await?;
+        trace!("Read packet content: {packet_buf:?}");
+        trace!("Elapsed={:?} delay={:?}", start_time.elapsed(), display_delay);
         if start_time.elapsed() > display_delay {
             let timestamp = packet_header.timestamp();
             let direction =
                 Direction::parse_from_payload(&packet_buf).unwrap_or(Direction::Unknown);
+            trace!("Writing packet...");
             pcap_writer.write_packet(&PcapPacket {
                 timestamp,
                 data: Cow::from(&[&direction.to_hci_pseudo_header(), &packet_buf[..]].concat()),
                 orig_len: packet_header.original_length + 4,
             })?;
         }
+        trace!("Flushing...");
         stdout().flush()?;
     }
     Ok(())
@@ -177,9 +186,9 @@ async fn print_packets(
                 .await?;
             extcap_control.status_message("BTsnoop logging is turned off. Use View > Interface Toolbars to show the buttons to turn it on").await?;
         }
-        let cmd_string = format!("until [ -f '{btsnoop_log_file_path}' ]; do sleep 1; done; tail -f -c +0 '{btsnoop_log_file_path}'");
+        let cmd_string = format!(r"until [ -f '{btsnoop_log_file_path}' ]; do sleep 1; done; tail -f -c +0 '{btsnoop_log_file_path}'");
         let mut cmd = root_shell
-            .shell(cmd_string.as_str())
+            .exec_out(cmd_string.as_str())
             .stdout(Stdio::piped())
             .spawn()?;
         info!("Running {cmd_string}");
