@@ -5,7 +5,8 @@ use btsnoop::{FileHeader, PacketHeader};
 use btsnoop_ext::Direction;
 use clap::Parser;
 use lazy_static::lazy_static;
-use log::{debug, info, warn};
+use log::{debug, info, warn, LevelFilter, trace};
+use log4rs::{append::file::FileAppender, encode::pattern::PatternEncoder, Config, config::{Appender, Root}};
 use nom_derive::Parse as _;
 use pcap_file::{
     pcap::{PcapHeader, PcapPacket, PcapWriter},
@@ -25,6 +26,7 @@ use std::{
     io::{stdout, Write},
     process::Stdio,
     time::{Duration, Instant},
+    path::Path,
 };
 use tokio::{
     fs::File,
@@ -74,42 +76,53 @@ async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
         endianness: pcap_file::Endianness::Big,
         ..Default::default()
     };
+    trace!("Reading header...");
     let mut header_buf = [0_u8; FileHeader::LENGTH];
     input_reader.read_exact(&mut header_buf[..]).await?;
+    trace!("Parsing header...");
     FileHeader::parse(&header_buf).unwrap();
     let mut pcap_writer = PcapWriter::with_header(output_writer, pcap_header).unwrap();
     let start_time = Instant::now();
+    trace!("Start looping...");
     while let Some(packet_header_buf) = input_reader
         .try_read_exact::<{ PacketHeader::LENGTH }>()
         .await?
     {
+        trace!("read header: {packet_header_buf:?}");
         let (_rem, packet_header) = PacketHeader::parse(&packet_header_buf).unwrap();
+        trace!("Packet length: {packet_header:?}");
         let mut packet_buf: Vec<u8> = vec![0_u8; packet_header.included_length as usize];
         input_reader.read_exact(&mut packet_buf).await?;
+        trace!("Read packet content: {packet_buf:?}");
+        trace!("Elapsed={:?} delay={:?}", start_time.elapsed(), display_delay);
         if start_time.elapsed() > display_delay {
             let timestamp = packet_header.timestamp();
             let direction =
                 Direction::parse_from_payload(&packet_buf).unwrap_or(Direction::Unknown);
+            trace!("Writing packet...");
             pcap_writer.write_packet(&PcapPacket {
                 timestamp,
                 data: Cow::from(&[&direction.to_hci_pseudo_header(), &packet_buf[..]].concat()),
                 orig_len: packet_header.original_length + 4,
             })?;
         }
+        trace!("Flushing...");
         stdout().flush()?;
     }
     Ok(())
 }
 
 async fn handle_control_packet(
-    serial: String,
+    adb_path: &Path,
+    serial: &str,
     control_packet: ControlPacket<'_>,
     extcap_control: &mut Option<ExtcapControlSender>,
 ) -> anyhow::Result<()> {
+    let shell = adb::root(adb_path, serial).await?;
     if control_packet.command == ControlCommand::Set {
         if control_packet.control_number == BT_LOGGING_ON_BUTTON.control_number {
             // Turn on
-            BtsnoopLogSettings::set_mode(&serial, BtsnoopLogMode::Full).await?;
+            BtsnoopLogSettings::set_mode(&shell, BtsnoopLogMode::Full).await?;
             extcap_control
                 .send(BT_LOGGING_ON_BUTTON.set_enabled(false))
                 .await?;
@@ -118,7 +131,7 @@ async fn handle_control_packet(
                 .await?;
         } else if control_packet.control_number == BT_LOGGING_OFF_BUTTON.control_number {
             // Turn off
-            BtsnoopLogSettings::set_mode(&serial, BtsnoopLogMode::Disabled).await?;
+            BtsnoopLogSettings::set_mode(&shell, BtsnoopLogMode::Disabled).await?;
             extcap_control
                 .send(BT_LOGGING_OFF_BUTTON.set_enabled(false))
                 .await?;
@@ -133,6 +146,7 @@ async fn handle_control_packet(
 }
 
 async fn print_packets(
+    adb_path: &Path,
     serial: &str,
     extcap_control: &Mutex<Option<ExtcapControlSender>>,
     output_fifo: &mut std::fs::File,
@@ -145,16 +159,18 @@ async fn print_packets(
     let write_result = if let Some(test_file) = btsnoop_log_file_path.strip_prefix("local:") {
         write_pcap_packets(File::open(test_file).await?, output_fifo, display_delay).await
     } else {
-        match adb::root(serial).await {
+        let root_shell = match adb::root(adb_path, serial).await {
             Err(e @ AdbRootError::RootDeclined) => {
-                extcap_control.info_message("Unable to run `adb root`. Make sure your device is on a userdebug or eng build").await?;
+                extcap_control.info_message(
+                    "Unable to get root access. Make sure your device is rooted or on a userdebug/eng build"
+                ).await?;
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 Err(e)?
             }
             Err(e) => Err(e)?,
-            Ok(_) => (),
-        }
-        if BtsnoopLogSettings::mode(serial).await? == BtsnoopLogMode::Full {
+            Ok(shell) => shell,
+        };
+        if let Ok(BtsnoopLogMode::Full) = BtsnoopLogSettings::mode(&root_shell).await {
             extcap_control
                 .send(BT_LOGGING_ON_BUTTON.set_enabled(false))
                 .await?;
@@ -170,13 +186,12 @@ async fn print_packets(
                 .await?;
             extcap_control.status_message("BTsnoop logging is turned off. Use View > Interface Toolbars to show the buttons to turn it on").await?;
         }
-        let mut cmd = adb::shell(
-            serial,
-            format!("tail -F -c +0 {btsnoop_log_file_path}").as_str(),
-        )
-        .stdout(Stdio::piped())
-        .spawn()?;
-        info!("Running adb tail -F -c +0 {btsnoop_log_file_path}");
+        let cmd_string = format!(r"until [ -f '{btsnoop_log_file_path}' ]; do sleep 1; done; tail -f -c +0 '{btsnoop_log_file_path}'");
+        let mut cmd = root_shell
+            .exec_out(cmd_string.as_str())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        info!("Running {cmd_string}");
         let stdout = cmd.stdout.as_mut().unwrap();
         write_pcap_packets(stdout, output_fifo, display_delay).await
     };
@@ -203,7 +218,16 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    let mut log_path = std::env::temp_dir();
+    log_path.push("btsnoop.log");
+    let logs = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new("{d} {l} - {m}{n}")))
+        .build(log_path)?;
+
+    let config = Config::builder()
+        .appender(Appender::builder().build("btsnoop", Box::new(logs)))
+        .build(Root::builder().appender("btsnoop").build(LevelFilter::Trace))?;
+    log4rs::init_config(config)?;
     let args = BtsnoopArgs::parse();
     debug!("Running with args: {args:#?}");
     let dlt = Dlt::builder()
@@ -213,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
         .build();
     match args.extcap.run()? {
         ExtcapStep::Interfaces(interfaces_step) => {
-            let interfaces: Vec<Interface> = adb::adb_devices(args.adb_path)
+            let interfaces: Vec<Interface> = adb::adb_devices(&adb::find_adb(args.adb_path)?)
                 .await?
                 .iter()
                 .map(|d| {
@@ -248,12 +272,14 @@ async fn main() -> anyhow::Result<()> {
             let extcap_reader = capture_step.new_control_reader_async().await;
             let extcap_sender: Mutex<Option<ExtcapControlSender>> =
                 Mutex::new(capture_step.new_control_sender_async().await);
+            let adb_path = adb::find_adb(args.adb_path)?;
             let result = tokio::try_join!(
                 async {
                     if let Some(mut reader) = extcap_reader {
                         while let Ok(packet) = reader.read_control_packet().await {
                             handle_control_packet(
-                                serial.to_string(),
+                                &adb_path,
+                                serial,
                                 packet,
                                 &mut *extcap_sender.lock().await,
                             )
@@ -264,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok::<(), anyhow::Error>(())
                 },
                 print_packets(
+                    &adb_path,
                     serial,
                     &extcap_sender,
                     &mut capture_step.fifo,

@@ -1,41 +1,122 @@
 //! Utilities for functionalities related to Android Debug Bridge.
 
-use std::{io::BufRead, process::Stdio, time::Duration};
+use std::{
+    io::BufRead,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
-use anyhow::anyhow;
 use log::debug;
 use thiserror::Error;
 use tokio::process::Command;
 
 #[derive(Error, Debug)]
 pub enum AdbRootError {
-    #[error("Root was declined. Check that you are on a userdebug or eng build.")]
+    #[error(
+        "Unable to get root access. Make sure your device is rooted or on a userdebug/eng build."
+    )]
     RootDeclined,
 
     #[error(transparent)]
     IoError(#[from] std::io::Error),
 }
 
+fn trim_end(input: &[u8]) -> &[u8] {
+    match input.iter().rposition(|c| !u8::is_ascii_whitespace(c)) {
+        Some(pos) => &input[..=pos],
+        None => b"",
+    }
+}
+
+#[test]
+fn trim_end_test() {
+    assert_eq!(trim_end(b"hi"), b"hi");
+    assert_eq!(trim_end(b"hi\n"), b"hi");
+    assert_eq!(trim_end(b"hi\r\n"), b"hi");
+    assert_eq!(trim_end(b"\r\n"), b"");
+}
+
+/// An ADB shell that can be rooted.
+pub struct RootShell {
+    /// Path to the adb executable
+    adb_path: PathBuf,
+    /// The serial number of the Android device
+    serial: String,
+    /// Whether `su` is needed on subsequent shell invocations. This is true
+    /// typically on a rooted production build. If false, we can run `adb root`
+    /// to gain root access, so subsequent shell invocations don't need `su`.
+    needs_su: bool,
+}
+
+impl RootShell {
+    /// Run adb shell on the given device.
+    ///
+    /// Example:
+    /// ```
+    /// let cmd = adb::shell(serial, format!("echo {}", serial)).spawn()?;
+    /// assert_eq!(cmd.wait_with_output().await?.stdout, serial);
+    /// ```
+    pub fn exec_out(&self, command: &str) -> Command {
+        let mut cmd = Command::new(&self.adb_path);
+        if !self.needs_su {
+            cmd.args(["-s", &self.serial, "exec-out", command]);
+        } else {
+            cmd.args([
+                "-s",
+                &self.serial,
+                "exec-out",
+                // For some reason, `adb exec-out su -c <cmd>` still adds
+                // newlines as if `adb shell` is being used, but that behavior
+                // is suppressed when the output is piped to `cat`.
+                &format!("su -c {} | cat", shlex::quote(command)),
+            ]);
+        }
+        debug!("ADB shell [{cmd:?}]");
+        cmd
+    }
+}
+
 /// Run adb root on the given device.
-pub async fn root(serial: &str) -> Result<(), AdbRootError> {
-    Command::new("adb")
+pub async fn root(adb_path: &Path, serial: &str) -> Result<RootShell, AdbRootError> {
+    Command::new(adb_path)
         .args(["-s", serial, "root"])
         .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?
-        .wait()
+        .wait_with_output()
         .await?;
-    let shell_uid = shell(serial, "id -u")
+    let shell_uid = exec_out(adb_path, serial, "id -u")
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?
         .wait_with_output()
         .await?
         .stdout;
     debug!("Shell UID={shell_uid:?}");
-    if shell_uid != b"0\n" {
-        // If only `adb root` will return a different exit code...
-        Err(AdbRootError::RootDeclined)?;
+    // If only `adb root` will return a different exit code...
+    if trim_end(&shell_uid) != b"0" {
+        let shell_uid = exec_out(adb_path, serial, "su -c id -u")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?
+            .wait_with_output()
+            .await?
+            .stdout;
+        if trim_end(&shell_uid) != b"0" {
+            Err(AdbRootError::RootDeclined)?;
+        } else {
+            return Ok(RootShell {
+                adb_path: adb_path.to_owned(),
+                serial: serial.to_string(),
+                needs_su: true,
+            });
+        }
     }
-    Ok(())
+    Ok(RootShell {
+        adb_path: adb_path.to_owned(),
+        serial: serial.to_string(),
+        needs_su: false,
+    })
 }
 
 /// Run adb shell on the given device.
@@ -45,9 +126,10 @@ pub async fn root(serial: &str) -> Result<(), AdbRootError> {
 /// let cmd = adb::shell(serial, format!("echo {}", serial)).spawn()?;
 /// assert_eq!(cmd.wait_with_output().await?.stdout, serial);
 /// ```
-pub fn shell(serial: &str, command: &str) -> Command {
-    let mut cmd = Command::new("adb");
-    cmd.args(["-s", serial, "shell", command]);
+pub fn exec_out(adb_path: &Path, serial: &str, command: &str) -> Command {
+    let mut cmd = Command::new(adb_path);
+    cmd.stderr(Stdio::null());
+    cmd.args(["-s", serial, "exec-out", command]);
     cmd
 }
 
@@ -61,16 +143,16 @@ pub struct AdbDevice {
 }
 
 /// Query `adb devices` for the list of devices, and return a vec of [`AdbDevice`] structs.
-pub async fn adb_devices(adb_path: Option<String>) -> anyhow::Result<Vec<AdbDevice>> {
+pub async fn adb_devices(adb_path: &Path) -> anyhow::Result<Vec<AdbDevice>> {
     debug!("Getting adb devices from {adb_path:?}");
-    let adb_path = adb_path.as_deref().unwrap_or("adb");
-    if adb_path == "mock" {
+    if adb_path == Path::new("mock") {
         return Ok(mock_adb_devices());
     }
-    let cmd = Command::new("adb")
+    let cmd = Command::new(adb_path)
         .arg("devices")
         .arg("-l")
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?;
     let output = cmd.wait_with_output().await?;
     debug!(
@@ -119,25 +201,22 @@ pub enum BtsnoopLogMode {
 pub enum BtsnoopLogSettings {}
 
 impl BtsnoopLogSettings {
-    pub async fn set_mode(serial: &str, mode: BtsnoopLogMode) -> std::io::Result<()> {
+    pub async fn set_mode(shell: &RootShell, mode: BtsnoopLogMode) -> std::io::Result<()> {
         let mode_str = match mode {
             BtsnoopLogMode::Disabled => "disabled",
             BtsnoopLogMode::Filtered => "filtered",
             BtsnoopLogMode::Full => "full",
         };
-        shell(
-            serial,
-            &format!("setprop persist.bluetooth.btsnooplogmode {mode_str}"),
-        )
-        .spawn()?
-        .wait()
-        .await?;
-        shell(serial, "svc bluetooth disable")
-            .spawn()?
-            .wait()
-            .await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        shell(serial, "svc bluetooth enable")
+        shell
+            .exec_out(&format!(
+                concat!(
+                    "setprop persist.bluetooth.btsnooplogmode {mode}",
+                    " && svc bluetooth disable",
+                    " && sleep 2",
+                    " && svc bluetooth enable"
+                ),
+                mode = mode_str
+            ))
             .spawn()?
             .wait()
             .await?;
@@ -145,16 +224,101 @@ impl BtsnoopLogSettings {
     }
 
     /// Gets the value of btsnoop log mode setting.
-    pub async fn mode(serial: &str) -> anyhow::Result<BtsnoopLogMode> {
-        let btsnooplogmode_proc = shell(serial, "getprop persist.bluetooth.btsnooplogmode")
+    pub async fn mode(root_shell: &RootShell) -> anyhow::Result<BtsnoopLogMode> {
+        let btsnooplogmode_proc = root_shell
+            .exec_out("getprop persist.bluetooth.btsnooplogmode")
             .stdout(Stdio::piped())
             .spawn()?;
         let output = btsnooplogmode_proc.wait_with_output().await?;
-        match output.stdout.as_slice() {
-            b"full\n" => Ok(BtsnoopLogMode::Full),
-            b"filtered\n" => Ok(BtsnoopLogMode::Filtered),
-            b"disabled\n" => Ok(BtsnoopLogMode::Disabled),
-            _ => Err(anyhow!("Unknown BTsnoop log mode")),
+        match trim_end(&output.stdout) {
+            b"full" => Ok(BtsnoopLogMode::Full),
+            b"filtered" => Ok(BtsnoopLogMode::Filtered),
+            b"disabled" => Ok(BtsnoopLogMode::Disabled),
+            _ => Ok(BtsnoopLogMode::Disabled),
         }
     }
+}
+
+pub fn find_adb(adb_path: Option<String>) -> anyhow::Result<PathBuf> {
+    match adb_path {
+        Some(path) => Ok(path.into()),
+        None => match which::which("adb") {
+            Ok(result) => Ok(result),
+            Err(_) => Ok(if cfg!(target_os = "windows") {
+                let mut adb_default_path = dirs_next::data_local_dir()
+                    .ok_or_else(|| anyhow::format_err!("Cannot find data local directory"))?;
+                adb_default_path.push(r"Android\sdk\platform-tools\adb");
+                adb_default_path
+            } else {
+                let mut adb_default_path = dirs_next::home_dir()
+                    .ok_or_else(|| anyhow::format_err!("Cannot find home directory"))?;
+                adb_default_path.push("Library/Android/Sdk/platform-tools/adb");
+                adb_default_path
+            }),
+        },
+    }
+}
+
+/// Tests our assumptions about the behavior of adb. These tests require you to
+/// be connected to a device over adb in order to run. To ignore these tests, use
+///
+/// ```sh
+/// cargo test -- --skip skip_in_ci
+/// ```
+#[cfg(test)]
+mod skip_in_ci_adb_assumption_tests {
+    use assert_cmd::Command;
+    use predicates::prelude::predicate;
+
+    #[cfg(windows)]
+    const LINE_ENDING: &str = "\r\n";
+    #[cfg(not(windows))]
+    const LINE_ENDING: &str = "\n";
+
+    #[test]
+    fn adb_exec_out_with_su() {
+        // We don't really care about the results of this test, but this
+        // illustrates why we needed `| cat` in our implementation.
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("exec-out")
+            .arg(r#"su -c "echo -n 'hello\nworld'""#);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff("hello\r\nworld")
+        );
+    }
+
+    #[test]
+    fn adb_exec_out_with_su_and_cat() {
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("exec-out")
+            .arg(r#"su -c "echo -n 'hello\nworld'" | cat"#);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff("hello\nworld")
+        );
+    }
+
+    #[test]
+    fn adb_exec_out() {
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("exec-out")
+            .arg("echo -n 'hello\nworld'");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff("hello\nworld")
+        );
+    }
+
+    #[test]
+    fn adb_shell() {
+        let mut cmd = Command::new(super::find_adb(None).unwrap());
+        cmd.arg("shell")
+            .arg("echo -n 'hello\nworld'");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::diff(format!("hello{LINE_ENDING}world"))
+        );
+    }
+
 }

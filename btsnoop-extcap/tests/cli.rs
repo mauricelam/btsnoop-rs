@@ -1,4 +1,5 @@
 use assert_cmd::prelude::*;
+use assert_fs::prelude::PathAssert;
 use indoc::indoc;
 use predicates::prelude::*;
 use std::process::Command;
@@ -26,19 +27,19 @@ fn contains(needle: &[u8]) -> impl Fn(&[u8]) -> bool + '_ {
 
 #[test]
 fn capture() {
+    let tmpfile = assert_fs::NamedTempFile::new("fifo").unwrap();
     let mut cmd = Command::cargo_bin("btsnoop-extcap").unwrap();
     cmd.arg("--extcap-interface")
         .arg("btsnoop-SERIAL")
         .arg("--capture")
         .arg("--fifo")
-        .arg("/dev/stdout")
+        .arg(tmpfile.path())
         .arg("--btsnoop-log-file-path")
         .arg("local:tests/testdata/btsnoop_hci.log")
         .arg("--display-delay")
         .arg("0");
-    cmd.assert()
-        .success()
-        .stdout(predicate::function(contains(b"Pixel 6 Pro")));
+    cmd.assert().success();
+    tmpfile.assert(predicate::function(contains(b"Pixel 6 Pro")).from_file_path());
 }
 
 #[test]
