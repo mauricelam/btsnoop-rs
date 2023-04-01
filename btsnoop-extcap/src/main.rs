@@ -170,7 +170,7 @@ async fn print_packets(
             Err(e) => Err(e)?,
             Ok(shell) => shell,
         };
-        if BtsnoopLogSettings::mode(&root_shell).await? == BtsnoopLogMode::Full {
+        if let Ok(BtsnoopLogMode::Full) = BtsnoopLogSettings::mode(&root_shell).await {
             extcap_control
                 .send(BT_LOGGING_ON_BUTTON.set_enabled(false))
                 .await?;
