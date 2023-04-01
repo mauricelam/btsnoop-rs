@@ -259,9 +259,14 @@ pub fn find_adb(adb_path: Option<String>) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Tests our assumptions about the behavior of adb.
+/// Tests our assumptions about the behavior of adb. These tests require you to
+/// be connected to a device over adb in order to run. To ignore these tests, use
+///
+/// ```sh
+/// cargo test -- --skip skip_in_ci
+/// ```
 #[cfg(test)]
-mod adb_assumption_tests {
+mod skip_in_ci_adb_assumption_tests {
     use assert_cmd::Command;
     use predicates::prelude::predicate;
 
