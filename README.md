@@ -8,7 +8,7 @@ This library provides parsing capaibilities for [btsnoop logs](https://fte.com/w
 
 ```toml
 [dependencies]
-btsnoop = "0.1.0"
+btsnoop = "0.2.0"
 ```
 
 ## Example
