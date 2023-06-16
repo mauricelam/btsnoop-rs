@@ -5,10 +5,15 @@ use btsnoop::{FileHeader, PacketHeader};
 use btsnoop_ext::Direction;
 use clap::Parser;
 use lazy_static::lazy_static;
-use log::{debug, info, warn, LevelFilter, trace};
-use log4rs::{append::file::FileAppender, encode::pattern::PatternEncoder, Config, config::{Appender, Root}};
+use log::{debug, info, trace, warn, LevelFilter};
+use log4rs::{
+    append::file::FileAppender,
+    config::{Appender, Root},
+    encode::pattern::PatternEncoder,
+    Config,
+};
 use nom_derive::Parse as _;
-use pcap_file::{
+use pcap_file_tokio::{
     pcap::{PcapHeader, PcapPacket, PcapWriter},
     DataLink,
 };
@@ -23,14 +28,14 @@ use r_extcap::{
 };
 use std::{
     borrow::Cow,
-    io::{stdout, Write},
+    path::Path,
     process::Stdio,
     time::{Duration, Instant},
-    path::Path,
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    signal::unix::SignalKind,
     sync::Mutex,
 };
 
@@ -66,14 +71,14 @@ pub struct BtsnoopArgs {
 /// Reads from the input, adds the corresponding PCAP headers, and writes to the
 /// output data. The `display_delay` can also be set such that packets read
 /// during an initial time period will not be displayed.
-async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
+async fn write_pcap_packets<W: AsyncWrite + Unpin, R: AsyncRead + Unpin + Send>(
     mut input_reader: R,
     output_writer: W,
     display_delay: Duration,
 ) -> anyhow::Result<()> {
     let pcap_header = PcapHeader {
         datalink: DataLink::BLUETOOTH_HCI_H4_WITH_PHDR,
-        endianness: pcap_file::Endianness::Big,
+        endianness: pcap_file_tokio::Endianness::Big,
         ..Default::default()
     };
     trace!("Reading header...");
@@ -81,7 +86,9 @@ async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
     input_reader.read_exact(&mut header_buf[..]).await?;
     trace!("Parsing header...");
     FileHeader::parse(&header_buf).unwrap();
-    let mut pcap_writer = PcapWriter::with_header(output_writer, pcap_header).unwrap();
+    let mut pcap_writer = PcapWriter::with_header(output_writer, pcap_header)
+        .await
+        .unwrap();
     let start_time = Instant::now();
     trace!("Start looping...");
     while let Some(packet_header_buf) = input_reader
@@ -94,20 +101,25 @@ async fn write_pcap_packets<W: Write, R: AsyncRead + Unpin + Send>(
         let mut packet_buf: Vec<u8> = vec![0_u8; packet_header.included_length as usize];
         input_reader.read_exact(&mut packet_buf).await?;
         trace!("Read packet content: {packet_buf:?}");
-        trace!("Elapsed={:?} delay={:?}", start_time.elapsed(), display_delay);
+        trace!(
+            "Elapsed={:?} delay={:?}",
+            start_time.elapsed(),
+            display_delay
+        );
         if start_time.elapsed() > display_delay {
             let timestamp = packet_header.timestamp();
             let direction =
                 Direction::parse_from_payload(&packet_buf).unwrap_or(Direction::Unknown);
             trace!("Writing packet...");
-            pcap_writer.write_packet(&PcapPacket {
-                timestamp,
-                data: Cow::from(&[&direction.to_hci_pseudo_header(), &packet_buf[..]].concat()),
-                orig_len: packet_header.original_length + 4,
-            })?;
+            pcap_writer
+                .write_packet(&PcapPacket {
+                    timestamp,
+                    data: Cow::from(&[&direction.to_hci_pseudo_header(), &packet_buf[..]].concat()),
+                    orig_len: packet_header.original_length + 4,
+                })
+                .await?;
+            trace!("Wrote packet");
         }
-        trace!("Flushing...");
-        stdout().flush()?;
     }
     Ok(())
 }
@@ -149,7 +161,7 @@ async fn print_packets(
     adb_path: &Path,
     serial: &str,
     extcap_control: &Mutex<Option<ExtcapControlSender>>,
-    output_fifo: &mut std::fs::File,
+    output_fifo: &mut Box<dyn AsyncWrite + Unpin + Send>,
     btsnoop_log_file_path: &Option<String>,
     display_delay: Duration,
 ) -> anyhow::Result<()> {
@@ -186,7 +198,9 @@ async fn print_packets(
                 .await?;
             extcap_control.status_message("BTsnoop logging is turned off. Use View > Interface Toolbars to show the buttons to turn it on").await?;
         }
-        let cmd_string = format!(r"until [ -f '{btsnoop_log_file_path}' ]; do sleep 1; done; tail -f -c +0 '{btsnoop_log_file_path}'");
+        let cmd_string = format!(
+            r"until [ -f '{btsnoop_log_file_path}' ]; do sleep 1; done; tail -f -c +0 '{btsnoop_log_file_path}'"
+        );
         let mut cmd = root_shell
             .exec_out(cmd_string.as_str())
             .stdout(Stdio::piped())
@@ -216,18 +230,7 @@ lazy_static! {
         .build();
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut log_path = std::env::temp_dir();
-    log_path.push("btsnoop.log");
-    let logs = FileAppender::builder()
-        .encoder(Box::new(PatternEncoder::new("{d} {l} - {m}{n}")))
-        .build(log_path)?;
-
-    let config = Config::builder()
-        .appender(Appender::builder().build("btsnoop", Box::new(logs)))
-        .build(Root::builder().appender("btsnoop").build(LevelFilter::Trace))?;
-    log4rs::init_config(config)?;
+async fn main_inner() -> anyhow::Result<()> {
     let args = BtsnoopArgs::parse();
     debug!("Running with args: {args:#?}");
     let dlt = Dlt::builder()
@@ -262,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
         }
         ExtcapStep::Config(_) => {}
         ExtcapStep::ReloadConfig(_) => {}
-        ExtcapStep::Capture(mut capture_step) => {
+        ExtcapStep::Capture(capture_step) => {
             let interface = capture_step.interface;
             assert!(
                 interface.starts_with("btsnoop-"),
@@ -273,10 +276,13 @@ async fn main() -> anyhow::Result<()> {
             let extcap_sender: Mutex<Option<ExtcapControlSender>> =
                 Mutex::new(capture_step.new_control_sender_async().await);
             let adb_path = adb::find_adb(args.adb_path)?;
+            let mut tokio_fifo = async_writer(capture_step.fifo);
             let result = tokio::try_join!(
                 async {
                     if let Some(mut reader) = extcap_reader {
+                        debug!("Starting control packet handling");
                         while let Ok(packet) = reader.read_control_packet().await {
+                            debug!("Handle 1 control packet");
                             handle_control_packet(
                                 &adb_path,
                                 serial,
@@ -284,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
                                 &mut *extcap_sender.lock().await,
                             )
                             .await?;
+                            debug!("Handle 1 control packet done");
                         }
                     }
                     debug!("Control packet handling ending");
@@ -293,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
                     &adb_path,
                     serial,
                     &extcap_sender,
-                    &mut capture_step.fifo,
+                    &mut tokio_fifo,
                     &args.btsnoop_log_file_path,
                     args.display_delay
                 ),
@@ -304,5 +311,56 @@ async fn main() -> anyhow::Result<()> {
             debug!("Capture ending");
         }
     }
+    Ok(())
+}
+
+fn async_writer(file: std::fs::File) -> Box<dyn AsyncWrite + Unpin + Send> {
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(File::from_std(file))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file.metadata().unwrap().file_type().is_fifo() {
+            Box::new(tokio::net::unix::pipe::Sender::from_file(file).unwrap())
+        } else {
+            Box::new(File::from_std(file))
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut log_path = std::env::temp_dir();
+    log_path.push("btsnoop.log");
+    let logs = FileAppender::builder()
+        .encoder(Box::new(PatternEncoder::new("{d} {l} - {m}{n}")))
+        .build(log_path)?;
+
+    let config = Config::builder()
+        .appender(Appender::builder().build("btsnoop", Box::new(logs)))
+        .build(
+            Root::builder()
+                .appender("btsnoop")
+                .build(LevelFilter::Trace),
+        )?;
+    log4rs::init_config(config)?;
+
+    async fn handle_sigterm() -> anyhow::Result<()> {
+        #[cfg(not(target_os = "windows"))]
+        let mut signal = tokio::signal::unix::signal(SignalKind::terminate())?;
+        #[cfg(target_os = "windows")]
+        let mut signal = tokio::signal::windows::ctrl_shutdown()?;
+        signal
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Failed to handle sigterm"))
+    }
+    tokio::select! {
+        result = main_inner() => result?,
+        _ = handle_sigterm() => { debug!("Got sigterm. Finishing...") },
+        _ = tokio::signal::ctrl_c() => { debug!("Got ctrl-C. Finishing...") },
+    };
     Ok(())
 }

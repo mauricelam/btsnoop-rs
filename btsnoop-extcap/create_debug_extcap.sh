@@ -7,10 +7,16 @@ set -ex
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-# NOTE: Change to ~/.local/lib/wireshark/extcap if using Wireshark 4.1 or above
-cat <<EOF > ~/.config/wireshark/extcap/btsnoop-extcap
-#! /usr/bin/env bash
-# Use exec to make sure the rust program will get SIGTERM from wireshark when stopping
-exec $SCRIPT_DIR/../target/debug/btsnoop-extcap "\$@"
-EOF
-chmod +x ~/.config/wireshark/extcap/btsnoop-extcap
+# NOTE: Change to ~/.config/wireshark/extcap if using Wireshark 4.0 or older
+WIRESHARK_PLUGIN_DEST="$HOME/.local/lib/wireshark/extcap/btsnoop-extcap"
+
+if [[ -e "$WIRESHARK_PLUGIN_DEST" ]]; then
+    echo "$WIRESHARK_PLUGIN_DEST already exists." >&2  
+    read -p "Overwrite? [y/N] " response
+    if [[ $response != "y" ]]; then
+        exit 1
+    fi
+    rm "$WIRESHARK_PLUGIN_DEST"
+fi
+
+ln -s "$SCRIPT_DIR/../target/debug/btsnoop-extcap" "$WIRESHARK_PLUGIN_DEST"

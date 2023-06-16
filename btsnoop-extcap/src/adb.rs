@@ -59,9 +59,10 @@ impl RootShell {
     pub fn exec_out(&self, command: &str) -> Command {
         let mut cmd = Command::new(&self.adb_path);
         if !self.needs_su {
-            cmd.args(["-s", &self.serial, "exec-out", command]);
+            cmd.kill_on_drop(true)
+                .args(["-s", &self.serial, "exec-out", command]);
         } else {
-            cmd.args([
+            cmd.kill_on_drop(true).args([
                 "-s",
                 &self.serial,
                 "exec-out",
@@ -130,6 +131,7 @@ pub fn exec_out(adb_path: &Path, serial: &str, command: &str) -> Command {
     let mut cmd = Command::new(adb_path);
     cmd.stderr(Stdio::null());
     cmd.args(["-s", serial, "exec-out", command]);
+    cmd.kill_on_drop(true);
     cmd
 }
 
@@ -280,12 +282,10 @@ mod skip_in_ci_adb_assumption_tests {
         // We don't really care about the results of this test, but this
         // illustrates why we needed `| cat` in our implementation.
         let mut cmd = Command::new(super::find_adb(None).unwrap());
-        cmd.arg("exec-out")
-            .arg(r#"su -c "echo -n 'hello\nworld'""#);
+        cmd.arg("exec-out").arg(r#"su -c "echo -n 'hello\nworld'""#);
         cmd.assert()
             .success()
-            .stdout(predicate::str::diff("hello\r\nworld")
-        );
+            .stdout(predicate::str::diff("hello\r\nworld"));
     }
 
     #[test]
@@ -295,30 +295,24 @@ mod skip_in_ci_adb_assumption_tests {
             .arg(r#"su -c "echo -n 'hello\nworld'" | cat"#);
         cmd.assert()
             .success()
-            .stdout(predicate::str::diff("hello\nworld")
-        );
+            .stdout(predicate::str::diff("hello\nworld"));
     }
 
     #[test]
     fn adb_exec_out() {
         let mut cmd = Command::new(super::find_adb(None).unwrap());
-        cmd.arg("exec-out")
-            .arg("echo -n 'hello\nworld'");
+        cmd.arg("exec-out").arg("echo -n 'hello\nworld'");
         cmd.assert()
             .success()
-            .stdout(predicate::str::diff("hello\nworld")
-        );
+            .stdout(predicate::str::diff("hello\nworld"));
     }
 
     #[test]
     fn adb_shell() {
         let mut cmd = Command::new(super::find_adb(None).unwrap());
-        cmd.arg("shell")
-            .arg("echo -n 'hello\nworld'");
+        cmd.arg("shell").arg("echo -n 'hello\nworld'");
         cmd.assert()
             .success()
-            .stdout(predicate::str::diff(format!("hello{LINE_ENDING}world"))
-        );
+            .stdout(predicate::str::diff(format!("hello{LINE_ENDING}world")));
     }
-
 }
