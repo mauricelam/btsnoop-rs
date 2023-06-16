@@ -16,7 +16,7 @@ categories = ["parser-implementations"]
 [dependencies]
 r-extcap = { version = "0.2.2" }
 btsnoop = { version = "0.2.0", path = "../btsnoop" }
-pcap-file-tokio = { version = "0.1.0", path = "../../pcap-file" }
+pcap-file-tokio = "0.1.0"
 anyhow = "1.0.71"
 clap = { version = "4.3.4", features = ["derive"] }
 nom-derive = "0.10.1"
