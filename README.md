@@ -1,6 +1,6 @@
 # Btsnoop parser library for Rust
 
-[![Build status](https://github.com/mauricelam/btsnoop-rs/workflows/ci/badge.svg)](https://github.com/mauricelam/btsnoop-rs/actions)
+[![Build status](https://github.com/mauricelam/btsnoop-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/mauricelam/btsnoop-rs/actions)
 [![Crates.io](https://img.shields.io/crates/v/btsnoop.svg)](https://crates.io/crates/btsnoop)
 [![Docs.rs](https://img.shields.io/badge/docs-rustdoc-green)](https://docs.rs/btsnoop)
 
