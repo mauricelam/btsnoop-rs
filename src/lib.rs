@@ -42,6 +42,8 @@ pub enum DatalinkType {
     HciUart = 1002,
     HciBscp = 1003,
     HciSerial = 1004,
+    Monitor = 2001,
+    Simulator = 2002,
 }
 
 /// The file header contains general metadata about the packet file and format of the packets it
