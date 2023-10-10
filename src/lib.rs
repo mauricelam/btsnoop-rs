@@ -35,15 +35,33 @@ pub struct File<'a> {
 }
 
 /// The type of datalink header used in the packet records that follow.
-#[derive(Nom, Debug)]
+#[derive(Nom, Debug, PartialEq, Eq)]
+#[nom(Selector = "u32")]
 #[repr(u32)]
 pub enum DatalinkType {
+    #[nom(Selector = "0..=1000")]
+    Reserved(u32),
+    #[nom(Selector = "1001")]
     UnencapsulatedHci = 1001,
+    #[nom(Selector = "1002")]
     HciUart = 1002,
+    #[nom(Selector = "1003")]
     HciBscp = 1003,
+    #[nom(Selector = "1004")]
     HciSerial = 1004,
+    #[nom(Selector = "2001")]
     Monitor = 2001,
+    #[nom(Selector = "2002")]
     Simulator = 2002,
+    #[nom(Selector = "1005..=u32::MAX")]
+    Unassigned(u32),
+}
+
+impl<'a> Parse<&'a [u8]> for DatalinkType {
+    fn parse(i: &'a [u8]) -> nom::IResult<&'a [u8], Self, nom::error::Error<&'a [u8]>> {
+        u32::parse_be(i)
+            .and_then(|(rem, value)| DatalinkType::parse(i, value).map(|(_, dlt)| (rem, dlt)))
+    }
 }
 
 /// The file header contains general metadata about the packet file and format of the packets it
@@ -57,6 +75,7 @@ pub struct FileHeader<'a> {
     #[nom(Verify = "*version == 1")]
     pub version: u32,
     /// The datalink type for the packet records that follow.
+    #[nom(Parse = "<DatalinkType as Parse<_>>::parse")]
     pub datalink_type: DatalinkType,
 }
 
@@ -229,6 +248,28 @@ mod tests {
         assert_eq!(
             file.packets[4].packet_data,
             &[0x00, 0x20, 0xc8, 0xb8, 0x48, 0xe8, 0x5d, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_parse_data_link_type() {
+        assert_eq!(
+            DatalinkType::Reserved(0),
+            <DatalinkType as Parse<_>>::parse(&0_u32.to_be_bytes())
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            DatalinkType::HciUart,
+            <DatalinkType as Parse<_>>::parse(&1002_u32.to_be_bytes())
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            DatalinkType::Unassigned(1048576),
+            <DatalinkType as Parse<_>>::parse(&1048576_u32.to_be_bytes())
+                .unwrap()
+                .1
         );
     }
 
