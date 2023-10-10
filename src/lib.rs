@@ -11,7 +11,7 @@
 //! ```rust
 //! use btsnoop::parse_btsnoop_file;
 //!
-//! let btsnoop_bytes: &[u8] = include_bytes!("testdata/btsnoop_hci.log");
+//! let btsnoop_bytes: &[u8] = include_bytes!("testdata/btsnoop_hci_android.log");
 //! let file: btsnoop::File = parse_btsnoop_file(btsnoop_bytes).unwrap();
 //! for packet in file.packets {
 //!     println!("Packet={:x?}", packet.packet_data);
@@ -212,8 +212,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_file_parsing_works() {
-        let hci_bytes = include_bytes!("testdata/btsnoop_hci.log");
+    fn valid_android_btsnoop_file_parsing_works() {
+        let hci_bytes = include_bytes!("testdata/btsnoop_hci_android.log");
         let (rem, file) = File::parse(hci_bytes).unwrap();
         assert!(rem.is_empty(), "Unexpected remaining bytes: {rem:?}");
         assert_eq!(file.packets.len(), 222);
@@ -221,8 +221,20 @@ mod tests {
     }
 
     #[test]
+    fn valid_btmon_file_parsing_works() {
+        let hci_bytes = include_bytes!("testdata/btsnoop_btmon.log");
+        let (rem, file) = File::parse(hci_bytes).unwrap();
+        assert!(rem.is_empty(), "Unexpected remaining bytes: {rem:?}");
+        assert_eq!(file.packets.len(), 554);
+        assert_eq!(
+            file.packets[4].packet_data,
+            &[0x00, 0x20, 0xc8, 0xb8, 0x48, 0xe8, 0x5d, 0x00]
+        );
+    }
+
+    #[test]
     fn truncated() {
-        let hci_bytes = include_bytes!("testdata/btsnoop_hci.log");
+        let hci_bytes = include_bytes!("testdata/btsnoop_hci_android.log");
         let hci_bytes = &hci_bytes[..hci_bytes.len() - 50];
         let (rem, file) = File::parse(hci_bytes).unwrap();
         assert!(!rem.is_empty());
@@ -232,7 +244,7 @@ mod tests {
 
     #[test]
     fn timestamp() {
-        let hci_bytes = include_bytes!("testdata/btsnoop_hci.log");
+        let hci_bytes = include_bytes!("testdata/btsnoop_hci_android.log");
         let (rem, file) = File::parse(hci_bytes).unwrap();
         assert!(rem.is_empty(), "Unexpected remaining bytes: {rem:?}");
         assert_eq!(
