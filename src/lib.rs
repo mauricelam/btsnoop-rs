@@ -11,7 +11,7 @@
 //! ```rust
 //! use btsnoop::parse_btsnoop_file;
 //!
-//! let btsnoop_bytes: &[u8] = include_bytes!("testdata/btsnoop_hci.log");
+//! let btsnoop_bytes: &[u8] = include_bytes!("testdata/btsnoop_hci_android.log");
 //! let file: btsnoop::File = parse_btsnoop_file(btsnoop_bytes).unwrap();
 //! for packet in file.packets {
 //!     println!("Packet={:x?}", packet.packet_data);
@@ -35,15 +35,33 @@ pub struct File<'a> {
 }
 
 /// The type of datalink header used in the packet records that follow.
-#[derive(Nom, Debug)]
+#[derive(Nom, Debug, PartialEq, Eq)]
+#[nom(Selector = "u32")]
 #[repr(u32)]
 pub enum DatalinkType {
+    #[nom(Selector = "0..=1000")]
+    Reserved(u32),
+    #[nom(Selector = "1001")]
     UnencapsulatedHci = 1001,
+    #[nom(Selector = "1002")]
     HciUart = 1002,
+    #[nom(Selector = "1003")]
     HciBscp = 1003,
+    #[nom(Selector = "1004")]
     HciSerial = 1004,
+    #[nom(Selector = "2001")]
     Monitor = 2001,
+    #[nom(Selector = "2002")]
     Simulator = 2002,
+    #[nom(Selector = "1005..=u32::MAX")]
+    Unassigned(u32),
+}
+
+impl<'a> Parse<&'a [u8]> for DatalinkType {
+    fn parse(i: &'a [u8]) -> nom::IResult<&'a [u8], Self, nom::error::Error<&'a [u8]>> {
+        u32::parse_be(i)
+            .and_then(|(rem, value)| DatalinkType::parse(i, value).map(|(_, dlt)| (rem, dlt)))
+    }
 }
 
 /// The file header contains general metadata about the packet file and format of the packets it
@@ -57,6 +75,7 @@ pub struct FileHeader<'a> {
     #[nom(Verify = "*version == 1")]
     pub version: u32,
     /// The datalink type for the packet records that follow.
+    #[nom(Parse = "<DatalinkType as Parse<_>>::parse")]
     pub datalink_type: DatalinkType,
 }
 
@@ -212,8 +231,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_file_parsing_works() {
-        let hci_bytes = include_bytes!("testdata/btsnoop_hci.log");
+    fn valid_android_btsnoop_file_parsing_works() {
+        let hci_bytes = include_bytes!("testdata/btsnoop_hci_android.log");
         let (rem, file) = File::parse(hci_bytes).unwrap();
         assert!(rem.is_empty(), "Unexpected remaining bytes: {rem:?}");
         assert_eq!(file.packets.len(), 222);
@@ -221,8 +240,42 @@ mod tests {
     }
 
     #[test]
+    fn valid_btmon_file_parsing_works() {
+        let hci_bytes = include_bytes!("testdata/btsnoop_btmon.log");
+        let (rem, file) = File::parse(hci_bytes).unwrap();
+        assert!(rem.is_empty(), "Unexpected remaining bytes: {rem:?}");
+        assert_eq!(file.packets.len(), 554);
+        assert_eq!(
+            file.packets[4].packet_data,
+            &[0x00, 0x20, 0xc8, 0xb8, 0x48, 0xe8, 0x5d, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_parse_data_link_type() {
+        assert_eq!(
+            DatalinkType::Reserved(0),
+            <DatalinkType as Parse<_>>::parse(&0_u32.to_be_bytes())
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            DatalinkType::HciUart,
+            <DatalinkType as Parse<_>>::parse(&1002_u32.to_be_bytes())
+                .unwrap()
+                .1
+        );
+        assert_eq!(
+            DatalinkType::Unassigned(1048576),
+            <DatalinkType as Parse<_>>::parse(&1048576_u32.to_be_bytes())
+                .unwrap()
+                .1
+        );
+    }
+
+    #[test]
     fn truncated() {
-        let hci_bytes = include_bytes!("testdata/btsnoop_hci.log");
+        let hci_bytes = include_bytes!("testdata/btsnoop_hci_android.log");
         let hci_bytes = &hci_bytes[..hci_bytes.len() - 50];
         let (rem, file) = File::parse(hci_bytes).unwrap();
         assert!(!rem.is_empty());
@@ -232,7 +285,7 @@ mod tests {
 
     #[test]
     fn timestamp() {
-        let hci_bytes = include_bytes!("testdata/btsnoop_hci.log");
+        let hci_bytes = include_bytes!("testdata/btsnoop_hci_android.log");
         let (rem, file) = File::parse(hci_bytes).unwrap();
         assert!(rem.is_empty(), "Unexpected remaining bytes: {rem:?}");
         assert_eq!(
