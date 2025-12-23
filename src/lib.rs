@@ -217,7 +217,7 @@ impl<'a> From<nom::Err<nom::error::Error<&[u8]>>> for Error<'a> {
 }
 
 /// Parses a given btsnoop file.
-pub fn parse_btsnoop_file(input: &[u8]) -> Result<File, Error> {
+pub fn parse_btsnoop_file(input: &[u8]) -> Result<File<'_>, Error<'_>> {
     let (rem, file) = File::parse(input)?;
     if rem.is_empty() {
         Ok(file)
